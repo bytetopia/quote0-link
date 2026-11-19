@@ -2,6 +2,18 @@
 
 把电脑上的状态和消息，通过 USB 送上标准版 Quote/0 墨水屏。非 MindReset 官方项目。
 
+## 界面预览
+
+**安装 Link**：选择屏幕版本后安装 App 内置的 Link 固件。
+
+![安装 Link 固件界面](docs/screenshots/maintenance-install.png)
+
+| 备份原厂 | 恢复原厂 |
+|---|---|
+| ![备份校验完成后下载文件](docs/screenshots/maintenance-backup.png) | ![选择本地备份文件恢复原厂固件](docs/screenshots/maintenance-restore.png) |
+
+截图中的设备标识、固件状态和电池读数均为示例。
+
 ## 两个独立部分
 
 | 层 | 职责 |
