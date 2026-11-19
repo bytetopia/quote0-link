@@ -1,0 +1,6 @@
+/dist/
+/firmware/build/
+/firmware/sdkconfig
+/firmware/sdkconfig.old
+*.bin
+.DS_Store

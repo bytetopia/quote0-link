@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quote0 Link</title>
+  <link rel="stylesheet" href="/ui.css">
+  <script src="/ui.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">USB DISPLAY CONTROL</p>
+      <h1>Quote0 Link<span>.</span></h1>
+      <p>把电脑上的状态和消息送上 Quote/0 墨水屏。</p>
+    </header>
+    <section>
+      <div class="section-title"><h2>设备与显示</h2><output id="status" role="status">读取状态中…</output></div>
+      <p class="badge" id="device">正在查找串口…</p>
+      <form id="display">
+        <label>模板
+          <select id="template">
+            <option value="card">标题 · 副标题 · 正文</option>
+            <option value="text">纯文字</option>
+            <option value="image">纯图片</option>
+          </select>
+        </label>
+        <div id="titles">
+          <label>标题<input id="title" value="Quote0 Link" maxlength="64"></label>
+          <label>副标题<input id="subtitle" value="USB DISPLAY" maxlength="64"></label>
+        </div>
+        <label id="body-field">正文<textarea id="body" rows="2" maxlength="512">Hello, Quote/0!</textarea></label>
+        <label id="image-field" hidden>图片（PNG 或 JPEG，最大 4 MB）<input id="image" type="file" accept="image/png,image/jpeg"></label>
+        <div class="actions"><button type="submit">发送到屏幕</button><button type="button" class="secondary" id="test">发送测试棋盘格</button></div>
+      </form>
+    </section>
+    <section>
+      <div class="section-title"><h2>集成目录</h2><span class="badge">本机 Hook</span></div>
+      <p>启用后，应用事件通过本地 API 自动上屏。关掉这个页面也会继续工作。</p>
+      <div id="integrations"></div>
+    </section>
+    <section>
+      <div class="section-title"><h2>设备维护</h2><span class="badge">USB 固件</span></div>
+      <p>先保存原厂备份，再安装 Link 固件。备份包含设备配置，请勿上传或分享。</p>
+      <p id="maintenance-connection" class="badge">请从系统托盘打开管理页。</p>
+      <div id="maintenance-controls" hidden>
+        <label>屏幕版本
+          <select id="panel-variant">
+            <option value="">请选择 Dot. App 设备详情显示的版本</option>
+            <option value="standard">标准版（无「首发版」标签，UC8251D）</option>
+            <option value="early">首发版（有「首发版」标签，UC8151）</option>
+          </select>
+        </label>
+        <p id="panel-note">不能通过 USB 自动判断屏幕版本。不确定时请不要刷写。</p>
+        <label class="inline"><input id="manual-rom" type="checkbox">已按设备说明手动进入 ROM 下载模式（仅在自动连接失败时勾选）</label>
+        <div class="actions">
+          <button type="button" class="secondary" data-maintenance="backup">备份原厂</button>
+          <button type="button" data-maintenance="install">安装 Link 固件</button>
+          <button type="button" class="secondary" data-maintenance="restore">恢复原厂</button>
+        </div>
+        <p id="maintenance-progress" role="status" aria-live="polite"></p>
+        <div class="backup-tools">
+          <h3>管理备份</h3>
+          <label>导出已保存的备份<select id="backup-list"></select></label>
+          <div class="actions">
+            <button type="button" class="secondary" id="backup-export">导出</button>
+            <button type="button" class="secondary" id="backup-import-button">导入 .q0backup</button>
+            <input id="backup-import" type="file" accept=".q0backup" hidden>
+          </div>
+          <p id="backup-result" role="status"></p>
+        </div>
+      </div>
+    </section>
+    <footer>本机服务 · USB 串口 · 不依赖云端</footer>
+  </main>
+</body>
+</html>
