@@ -3,10 +3,63 @@ const [launchToken, maintenanceToken] = location.hash.slice(1).split('.');
 const token = launchToken || sessionStorage.getItem('quote0.token');
 if (location.hash) {
   sessionStorage.setItem('quote0.token', token);
-  history.replaceState(null, '', location.pathname);
+  history.replaceState(null, '', location.pathname + location.search);
 }
 const status = byId('status');
 let submitting = false;
+let deviceRefreshing = false;
+
+const navigation = [...document.querySelectorAll('[data-page]')];
+const tabs = [...document.querySelectorAll('[data-tab]')];
+let currentTab;
+
+function showRoute() {
+  const search = new URLSearchParams(location.search);
+  const page = navigation.some(button => button.dataset.page === search.get('page')) ? search.get('page') : 'display';
+  currentTab = tabs.some(button => button.dataset.tab === search.get('tab')) ? search.get('tab') : 'backup';
+  for (const button of navigation) {
+    const active = button.dataset.page === page;
+    byId('page-' + button.dataset.page).hidden = !active;
+    if (active) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  for (const button of tabs) {
+    const active = button.dataset.tab === currentTab;
+    byId(button.getAttribute('aria-controls')).hidden = !active;
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
+  }
+  byId('variant-options').hidden = currentTab === 'restore';
+  if (maintenanceInfo) showMaintenance(maintenanceInfo);
+}
+
+function navigate(page, tab = 'backup') {
+  const url = new URL(location.href);
+  url.searchParams.set('page', page);
+  if (page === 'maintenance') url.searchParams.set('tab', tab);
+  else url.searchParams.delete('tab');
+  if (url.href !== location.href) history.pushState(null, '', url);
+  showRoute();
+}
+
+for (const button of navigation) {
+  button.onclick = () => navigate(button.dataset.page, currentTab);
+}
+for (const [index, button] of tabs.entries()) {
+  button.onclick = () => navigate('maintenance', button.dataset.tab);
+  button.onkeydown = event => {
+    const offsets = {ArrowLeft: -1, ArrowRight: 1};
+    let next;
+    if (event.key in offsets) next = (index + offsets[event.key] + tabs.length) % tabs.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    tabs[next].click();
+    tabs[next].focus();
+  };
+}
+window.addEventListener('popstate', showRoute);
 
 async function api(path, method = 'GET', data) {
   if (!token) throw new Error('请从菜单栏或托盘重新打开管理页。');
@@ -33,13 +86,57 @@ async function refresh() {
 }
 
 async function refreshDevice() {
+  if (deviceRefreshing) return;
+  deviceRefreshing = true;
   try {
-    const result = await api('device');
-    byId('device').textContent = result.port ? '已识别 USB 串口：' + result.port : result.error;
+    showDevice(await api('device'));
   } catch (error) {
-    byId('device').textContent = error.message;
+    showDevice({state: 'unknown', error: error.message});
+  } finally {
+    deviceRefreshing = false;
   }
 }
+
+function showDevice(result) {
+  const sidebar = byId('sidebar-device');
+  if (result.state === 'busy' && sidebar.dataset.state === 'connected') return;
+  sidebar.dataset.state = result.state;
+  const labels = {
+    connected: '设备已连接',
+    disconnected: '设备未连接',
+    unverified: 'USB 已识别，未确认固件',
+    busy: '设备忙',
+    maintenance: '设备维护中',
+  };
+  const connection = labels[result.state] || '设备状态不可用';
+  let version = '固件版本 · —';
+  let power = '电池电压 · 暂无读数';
+  if (result.state === 'connected') {
+    if (result.firmware_version) version = `固件 v${result.firmware_version}`;
+    else if (result.legacy_firmware) version = '旧版固件（未报告版本）';
+    else version = '固件版本未知';
+    const source = result.usb_power === true ? 'USB 供电' : result.usb_power === false ? '未检测到 USB 供电' : '';
+    const voltage = result.battery_mv ? `电池 ${(result.battery_mv / 1000).toFixed(2)} V` : '电池电压暂无读数';
+    power = source ? source + ' · ' + voltage : voltage;
+  }
+  const detail = result.port ? connection + ' · ' + result.port : result.error || connection;
+  const bundled = result.bundled_firmware_version;
+  for (const [id, text] of [
+    ['sidebar-connection', connection],
+    ['sidebar-firmware', version],
+    ['sidebar-power', power],
+    ['sidebar-update', bundled ? `可升级到 v${bundled}` : ''],
+    ['bundled-firmware', bundled ? `内置固件 v${bundled}` : ''],
+    ['device', detail],
+  ]) {
+    const element = byId(id);
+    if (element.textContent !== text) element.textContent = text;
+  }
+  byId('sidebar-update').hidden = !result.update_available || !bundled;
+  byId('bundled-firmware').hidden = !bundled;
+}
+
+byId('sidebar-update').onclick = () => navigate('maintenance', 'install');
 
 async function send(makeCard) {
   if (submitting) return;
@@ -129,20 +226,25 @@ refresh();
 refreshDevice();
 loadIntegrations();
 setInterval(refresh, 1200);
-setInterval(refreshDevice, 3000);
+setInterval(refreshDevice, 4500);
 
 let maintenanceInfo;
 let maintenancePending = false;
+let maintenancePolling = false;
+let maintenanceError;
+let maintenanceGeneration = 0;
+let downloading = false;
 const maintenanceButtons = [...document.querySelectorAll('[data-maintenance]')];
+const restoreFile = byId('file-restore');
 
-async function maintenanceRequest(path = '', method = 'GET', data, binary = false) {
+async function maintenanceRequest(path = '', method = 'GET', data) {
+  const headers = {'Authorization': 'Bearer ' + maintenanceToken};
+  if (data !== undefined && !(data instanceof FormData)) {
+    headers['Content-Type'] = 'application/json';
+    data = JSON.stringify(data);
+  }
   const response = await fetch('/v1/maintenance' + path, {
-    method,
-    headers: {
-      'Authorization': 'Bearer ' + maintenanceToken,
-      'Content-Type': binary ? 'application/octet-stream' : 'application/json',
-    },
-    body: data === undefined ? undefined : binary ? data : JSON.stringify(data),
+    method, headers, body: data,
   });
   if (!response.ok) throw new Error((await response.json()).error || response.status);
   return response;
@@ -152,107 +254,128 @@ function showMaintenance(info) {
   maintenanceInfo = info;
   const variant = byId('panel-variant').value;
   const active = info.busy || maintenancePending;
-  const identified = info.available && !!info.mac && !!variant;
-  const hasBackup = info.backups.includes(info.mac);
+  const ready = info.available && !!info.mac && !active;
   byId('maintenance-controls').hidden = false;
   byId('maintenance-connection').textContent = info.mac
     ? '设备标识：' + info.mac + (info.port ? ' · ' + info.port : '')
     : '请只连接一台 Quote/0；未识别到带唯一 USB 标识的设备。';
   byId('panel-note').textContent = variant === 'early'
-    ? '首发版暂不支持安装 Link 固件。仍可备份，或恢复同一台设备的原厂备份。'
+    ? '首发版可以备份和恢复，但暂不支持安装 Link 固件。'
     : '不能通过 USB 自动判断屏幕版本。不确定时请不要刷写。';
-  if (!maintenancePending) {
-    byId('maintenance-progress').textContent = info.message ||
-      (info.available ? '' : '当前是开发包，缺少独立刷写工具。请使用完整安装包。');
-  }
+  const progress = byId('maintenance-progress');
+  const resultVisible = info.busy || info.action === currentTab;
+  const localError = maintenanceError?.action === currentTab ? maintenanceError.text : '';
+  progress.textContent = maintenancePending ? '正在提交…' : localError || (resultVisible && info.message) ||
+    (info.available ? '' : '当前是开发包，缺少独立刷写工具。请使用完整安装包。');
+  progress.dataset.error = String(!maintenancePending && (!!localError || (resultVisible && info.state === 'error')));
   byId('panel-variant').disabled = active;
   byId('manual-rom').disabled = active;
+  restoreFile.disabled = active;
   for (const button of maintenanceButtons) {
     const action = button.dataset.maintenance;
-    button.disabled = active || !identified ||
-      (action === 'backup' && hasBackup) ||
-      (action === 'restore' && !hasBackup) ||
-      (action === 'install' && (variant !== 'standard' || !hasBackup));
+    button.disabled = !ready ||
+      (action === 'backup' && !variant) ||
+      (action === 'restore' && !restoreFile.files.length) ||
+      (action === 'install' && variant !== 'standard');
   }
-  const backupList = byId('backup-list');
-  if ([...backupList.options].map(option => option.value).join(',') !== info.backups.join(',')) {
-    const previous = backupList.value;
-    backupList.replaceChildren(...info.backups.map(mac => new Option(mac, mac)));
-    if (info.backups.includes(previous)) backupList.value = previous;
-  }
-  byId('backup-export').disabled = active || !info.backups.length;
-  byId('backup-import-button').disabled = active;
+  byId('download-card').hidden = !info.download || (info.action === 'backup' && info.busy);
+  byId('download-name').textContent = info.download?.filename || '';
+  byId('backup-download').disabled = downloading;
 }
 
 async function refreshMaintenance() {
-  if (!maintenanceToken || maintenancePending) return;
+  if (!maintenanceToken || maintenancePending || maintenancePolling) return;
+  maintenancePolling = true;
+  const generation = maintenanceGeneration;
   try {
-    showMaintenance(await (await maintenanceRequest()).json());
+    const info = await (await maintenanceRequest()).json();
+    if (generation === maintenanceGeneration) showMaintenance(info);
   } catch (error) {
-    byId('maintenance-controls').hidden = true;
-    byId('maintenance-connection').textContent = error.message;
+    if (generation === maintenanceGeneration) {
+      maintenanceInfo = undefined;
+      byId('maintenance-controls').hidden = true;
+      byId('maintenance-connection').textContent = error.message;
+    }
+  } finally {
+    maintenancePolling = false;
   }
 }
 
-byId('panel-variant').onchange = () => {
+function updateMaintenanceOptions() {
+  maintenanceError = undefined;
   if (maintenanceInfo) showMaintenance(maintenanceInfo);
-};
+}
+byId('panel-variant').onchange = updateMaintenanceOptions;
+restoreFile.onchange = updateMaintenanceOptions;
+
 for (const button of maintenanceButtons) {
   button.onclick = async () => {
-    if (!maintenanceInfo || maintenancePending) return;
+    if (!maintenanceInfo || maintenancePending || maintenanceInfo.busy) return;
     const action = button.dataset.maintenance;
-    const variant = byId('panel-variant').value;
+    const variant = action === 'restore' ? '' : byId('panel-variant').value;
     const mac = maintenanceInfo.mac;
-    const model = variant === 'standard' ? '标准版（UC8251D）' : '首发版（UC8151）';
+    const file = action === 'restore' ? restoreFile.files[0] : undefined;
+    if (action === 'restore' && (!file || !/\.q0backup$/i.test(file.name) || file.size > 4 * 1024 * 1024 + 4096)) {
+      maintenanceError = {action, text: '请选择有效的 .q0backup 文件。'};
+      showMaintenance(maintenanceInfo);
+      return;
+    }
+    const model = {standard: '标准版（UC8251D）', early: '首发版（UC8151）'}[variant];
     const warning = {
       backup: '请确认这台设备目前仍是原厂固件。App 会读取两次，不会写入 Flash。',
       install: '会替换设备固件。刷第三方固件可能影响保修；维护期间请勿拔线、休眠或退出。',
       restore: '会以备份中的整片 Flash 覆盖当前内容，丢弃备份之后的设备设置。维护期间请勿拔线。',
     }[action];
-    if (!window.confirm(button.textContent + '\n设备 ' + mac + ' · ' + model + '\n\n' + warning)) return;
+    const details = [button.textContent, '设备 ' + mac + (model ? ' · ' + model : ''), file ? '文件：' + file.name : '', '', warning];
+    if (!window.confirm(details.join('\n'))) return;
+    maintenanceGeneration++;
     maintenancePending = true;
+    maintenanceError = undefined;
     showMaintenance(maintenanceInfo);
     try {
       const request = {action, variant, mac, confirm: true, manual_rom: byId('manual-rom').checked};
-      const result = await (await maintenanceRequest('', 'POST', request)).json();
+      let payload = request;
+      if (file) {
+        payload = new FormData();
+        payload.append('request', JSON.stringify(request));
+        payload.append('backup', file);
+      }
+      const result = await (await maintenanceRequest('', 'POST', payload)).json();
+      if (file) restoreFile.value = '';
+      if (action === 'backup') byId('download-result').textContent = '';
       maintenancePending = false;
       showMaintenance(result);
     } catch (error) {
       maintenancePending = false;
-      showMaintenance({...maintenanceInfo, message: error.message});
+      maintenanceError = {action, text: error.message};
+      showMaintenance(maintenanceInfo);
     }
   };
 }
-byId('backup-export').onclick = async () => {
-  const mac = byId('backup-list').value;
-  const result = byId('backup-result');
+byId('backup-download').onclick = async () => {
+  const download = maintenanceInfo?.download;
+  if (!download || downloading) return;
+  downloading = true;
+  showMaintenance(maintenanceInfo);
+  const result = byId('download-result');
   try {
-    const file = await (await maintenanceRequest('/backup/' + encodeURIComponent(mac))).blob();
+    const file = await (await maintenanceRequest('/backup/' + encodeURIComponent(download.id))).blob();
     const url = URL.createObjectURL(file);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'quote0-' + mac + '.q0backup';
+    link.download = download.filename;
+    document.body.append(link);
     link.click();
+    link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    result.textContent = '已发起下载；请把备份保存在私有位置。';
-  } catch (error) {
-    result.textContent = error.message;
-  }
-};
-byId('backup-import-button').onclick = () => byId('backup-import').click();
-byId('backup-import').onchange = async event => {
-  const file = event.target.files[0];
-  if (!file) return;
-  const result = byId('backup-result');
-  try {
-    const info = await (await maintenanceRequest('/import', 'POST', file, true)).json();
-    result.textContent = '已导入设备 ' + info.mac + ' 的备份。';
-    await refreshMaintenance();
+    result.textContent = '已发起下载。请确认文件已保存，并留在私有位置。';
   } catch (error) {
     result.textContent = error.message;
   } finally {
-    event.target.value = '';
+    downloading = false;
+    if (maintenanceInfo) showMaintenance(maintenanceInfo);
   }
 };
+showRoute();
 refreshMaintenance();
 if (maintenanceToken) setInterval(refreshMaintenance, 1400);

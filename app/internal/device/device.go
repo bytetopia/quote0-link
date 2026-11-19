@@ -106,27 +106,44 @@ func (link *Link) Send(frame Frame) error {
 }
 
 func send(name string, frame Frame) error {
-	port, err := serial.Open(name, &serial.Mode{BaudRate: 115200, InitialStatusBits: &serial.ModemOutputBits{}})
+	port, err := openPort(name)
 	if err != nil {
 		return err
 	}
 	defer port.Close()
-	if err := port.SetReadTimeout(250 * time.Millisecond); err != nil {
-		return err
-	}
-	if err := port.ResetInputBuffer(); err != nil {
-		return err
-	}
 	return exchange(port, frame)
 }
 
-func exchange(port io.ReadWriter, frame Frame) error {
-	reader := bufio.NewReaderSize(timeoutReader{port}, 256)
+func openPort(name string) (serial.Port, error) {
+	port, err := serial.Open(name, &serial.Mode{BaudRate: 115200, InitialStatusBits: &serial.ModemOutputBits{}})
+	if err != nil {
+		return nil, err
+	}
+	if err := port.SetReadTimeout(250 * time.Millisecond); err != nil {
+		port.Close()
+		return nil, err
+	}
+	if err := port.ResetInputBuffer(); err != nil {
+		port.Close()
+		return nil, err
+	}
+	return port, nil
+}
+
+func handshake(port io.Writer, reader *bufio.Reader) error {
 	if _, err := io.WriteString(port, "\nQ0PING\n"); err != nil {
 		return err
 	}
 	if err := await(reader, 2*time.Second, "Q0LINK 1 152 296", false); err != nil {
 		return fmt.Errorf("Quote0 Link firmware not responding: %w", err)
+	}
+	return nil
+}
+
+func exchange(port io.ReadWriter, frame Frame) error {
+	reader := bufio.NewReaderSize(timeoutReader{port}, 256)
+	if err := handshake(port, reader); err != nil {
+		return err
 	}
 	if _, err := fmt.Fprintf(port, "Q0IMG1 %d %d 1BPP %d %08x\n", Width, Height, len(frame), crc32.ChecksumIEEE(frame[:])); err != nil {
 		return err
@@ -152,6 +169,11 @@ func (reader timeoutReader) Read(buffer []byte) (int, error) {
 }
 
 func await(reader *bufio.Reader, timeout time.Duration, expected string, reportError bool) error {
+	_, err := awaitReply(reader, timeout, reportError, func(line string) bool { return line == expected })
+	return err
+}
+
+func awaitReply(reader *bufio.Reader, timeout time.Duration, reportError bool, accept func(string) bool) (string, error) {
 	end := time.Now().Add(timeout)
 	var line []byte
 	discard := false
@@ -161,16 +183,16 @@ func await(reader *bufio.Reader, timeout time.Duration, expected string, reportE
 			continue
 		}
 		if err != nil {
-			return err
+			return "", err
 		}
 		if value == '\n' {
 			if !discard {
 				message := strings.TrimSpace(string(line))
-				if message == expected {
-					return nil
+				if accept(message) {
+					return message, nil
 				}
 				if reportError && strings.HasPrefix(message, "ERR ") {
-					return errors.New(message)
+					return "", errors.New(message)
 				}
 			}
 			line, discard = line[:0], false
@@ -180,5 +202,5 @@ func await(reader *bufio.Reader, timeout time.Duration, expected string, reportE
 			discard = true
 		}
 	}
-	return errors.New("serial response timed out")
+	return "", errors.New("serial response timed out")
 }

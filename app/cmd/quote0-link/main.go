@@ -92,7 +92,7 @@ func run(port, font string, headless bool) error {
 	if err != nil {
 		return err
 	}
-	manager := maintenance.New(link, executable, filepath.Dir(tokenPath), testFrame)
+	manager := maintenance.New(link, executable, testFrame)
 	service.EnableMaintenance(manager, adminToken)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

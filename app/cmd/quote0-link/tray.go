@@ -5,22 +5,25 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/binary"
-	"image"
-	"image/color"
-	"image/draw"
-	"image/png"
 	"runtime"
 
 	"github.com/getlantern/systray"
 )
 
+//go:embed tray-template.png
+var trayTemplate []byte
+
+//go:embed tray-color.png
+var trayColor []byte
+
 func tray(ctx context.Context, canQuit func() bool, open func()) {
 	systray.Run(func() {
 		if runtime.GOOS == "darwin" {
-			systray.SetTemplateIcon(trayIcon(false), trayIcon(false))
+			systray.SetTemplateIcon(trayTemplate, trayTemplate)
 		} else {
-			systray.SetIcon(trayIcon(true))
+			systray.SetIcon(windowsTrayIcon())
 		}
 		systray.SetTooltip("Quote0 Link")
 		manage := systray.AddMenuItem("打开管理页", "Quote0 Link")
@@ -46,26 +49,11 @@ func tray(ctx context.Context, canQuit func() bool, open func()) {
 	}, func() {})
 }
 
-func trayIcon(windows bool) []byte {
-	canvas := image.NewRGBA(image.Rect(0, 0, 32, 32))
-	ink, paper := image.Black, image.Transparent
-	if windows {
-		ink = image.NewUniform(color.RGBA{36, 73, 52, 255})
-		paper = image.White
-	}
-	draw.Draw(canvas, image.Rect(2, 4, 30, 28), ink, image.Point{}, draw.Src)
-	draw.Draw(canvas, image.Rect(5, 7, 27, 25), paper, image.Point{}, draw.Src)
-	draw.Draw(canvas, image.Rect(8, 11, 24, 14), ink, image.Point{}, draw.Src)
-	draw.Draw(canvas, image.Rect(8, 18, 19, 21), ink, image.Point{}, draw.Src)
-	var asset bytes.Buffer
-	_ = png.Encode(&asset, canvas)
-	if !windows {
-		return asset.Bytes()
-	}
+func windowsTrayIcon() []byte {
 	var ico bytes.Buffer
 	ico.Write([]byte{0, 0, 1, 0, 1, 0, 32, 32, 0, 0, 1, 0, 32, 0})
-	_ = binary.Write(&ico, binary.LittleEndian, uint32(asset.Len()))
+	_ = binary.Write(&ico, binary.LittleEndian, uint32(len(trayColor)))
 	_ = binary.Write(&ico, binary.LittleEndian, uint32(22))
-	ico.Write(asset.Bytes())
+	ico.Write(trayColor)
 	return ico.Bytes()
 }

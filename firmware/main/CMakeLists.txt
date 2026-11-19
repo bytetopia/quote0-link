@@ -4,7 +4,7 @@ if(NOT EXISTS "${driver}/uc8251d_minimal.c")
 endif()
 
 idf_component_register(
-    SRCS "main.c" "${driver}/uc8251d_minimal.c"
+    SRCS "main.c" "power.c" "${driver}/uc8251d_minimal.c"
     INCLUDE_DIRS "${driver}"
-    PRIV_REQUIRES esp_driver_gpio esp_driver_spi esp_driver_usb_serial_jtag esp_timer
+    PRIV_REQUIRES esp_driver_gpio esp_driver_spi esp_driver_usb_serial_jtag esp_timer esp_adc esp_hw_support esp_app_format
 )

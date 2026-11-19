@@ -3,11 +3,15 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
+#include "esp_app_desc.h"
 #include "freertos/FreeRTOS.h"
+#include "power.h"
 #include "uc8251d_minimal.h"
 
 static uint8_t frame[UC8251D_BUFFER_SIZE];
+static bool panel_ready;
 
 static const uc8251d_config_t panel = {
     .spi_host = SPI2_HOST,
@@ -52,10 +56,46 @@ static bool read_frame(void)
     return true;
 }
 
+static esp_err_t display_frame(void)
+{
+    const gpio_num_t supply = (gpio_num_t)panel.pin_vin;
+    esp_err_t result;
+    if (!panel_ready) {
+        result = uc8251d_init(&panel);
+        panel_ready = result == ESP_OK;
+    } else {
+        result = gpio_set_level(supply, 1);
+        if (result == ESP_OK) {
+            result = gpio_set_direction(supply, GPIO_MODE_OUTPUT);
+        }
+    }
+    if (result == ESP_OK) {
+        result = uc8251d_display(frame);
+        if (result == ESP_OK) {
+            uc8251d_sleep();
+        }
+    }
+    gpio_set_direction(supply, GPIO_MODE_INPUT);
+    return result;
+}
+
 static void handle_line(const char *line)
 {
     if (strcmp(line, "Q0PING") == 0) {
         reply("Q0LINK 1 152 296\n");
+        return;
+    }
+    if (strcmp(line, "Q0VERSION") == 0) {
+        char version[40];
+        snprintf(version, sizeof(version), "Q0FW %s\n", esp_app_get_description()->version);
+        reply(version);
+        return;
+    }
+    if (strcmp(line, "Q0STATUS") == 0) {
+        char status[48];
+        int battery_mv = power_battery_mv();
+        snprintf(status, sizeof(status), "Q0POWER 1 %d %d\n", power_usb_present(), battery_mv);
+        reply(status);
         return;
     }
     const char prefix[] = "Q0IMG1 152 296 1BPP 5624 ";
@@ -73,7 +113,7 @@ static void handle_line(const char *line)
     } else if (frame_crc() != checksum) {
         reply("ERR checksum\n");
     } else {
-        reply(uc8251d_display(frame) == ESP_OK ? "OK\n" : "ERR panel\n");
+        reply(display_frame() == ESP_OK ? "OK\n" : "ERR panel\n");
     }
 }
 
@@ -83,13 +123,14 @@ void app_main(void)
         .tx_buffer_size = 512,
         .rx_buffer_size = 8192,
     };
-    ESP_ERROR_CHECK(uc8251d_init(&panel));
+    power_init();
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb));
 
     char line[64];
     size_t length = 0;
     bool overflow = false;
     while (true) {
+        power_sleep_if_unplugged();
         char byte;
         if (usb_serial_jtag_read_bytes(&byte, 1, pdMS_TO_TICKS(1000)) != 1) {
             length = 0;

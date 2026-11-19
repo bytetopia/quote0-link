@@ -68,6 +68,7 @@ func (service *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", service.asset("index.html", "text/html; charset=utf-8"))
 	mux.HandleFunc("GET /ui.js", service.asset("ui.js", "text/javascript; charset=utf-8"))
 	mux.HandleFunc("GET /ui.css", service.asset("ui.css", "text/css; charset=utf-8"))
+	mux.HandleFunc("GET /favicon.svg", service.asset("favicon.svg", "image/svg+xml"))
 	mux.HandleFunc("GET /v1/device", service.auth(service.getDevice))
 	mux.HandleFunc("GET /v1/status", service.auth(service.getStatus))
 	mux.HandleFunc("POST /v1/display", service.auth(service.display))
@@ -77,8 +78,7 @@ func (service *Service) Handler() http.Handler {
 	if service.maint != nil {
 		mux.HandleFunc("GET /v1/maintenance", service.maintenanceAuth(service.maintenanceStatus))
 		mux.HandleFunc("POST /v1/maintenance", service.maintenanceAuth(service.startMaintenance))
-		mux.HandleFunc("POST /v1/maintenance/import", service.maintenanceAuth(service.importBackup))
-		mux.HandleFunc("GET /v1/maintenance/backup/{mac}", service.maintenanceAuth(service.exportBackup))
+		mux.HandleFunc("GET /v1/maintenance/backup/{id}", service.maintenanceAuth(service.downloadBackup))
 	}
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Host != service.host {
@@ -119,17 +119,26 @@ func (service *Service) getStatus(writer http.ResponseWriter, _ *http.Request) {
 }
 
 func (service *Service) getDevice(writer http.ResponseWriter, _ *http.Request) {
-	locator, ok := service.sender.(interface{ PortName() (string, error) })
-	if !ok {
-		fail(writer, http.StatusNotImplemented, errors.New("serial detection unavailable"))
-		return
+	var status device.Status
+	if service.maintenanceBusy() {
+		status.State = "maintenance"
+	} else {
+		locator, ok := service.sender.(interface{ Status() device.Status })
+		if !ok {
+			fail(writer, http.StatusNotImplemented, errors.New("serial detection unavailable"))
+			return
+		}
+		status = locator.Status()
 	}
-	name, err := locator.PortName()
-	if err != nil {
-		respond(writer, http.StatusOK, map[string]string{"error": err.Error()})
-		return
+	var bundled string
+	if service.maint != nil {
+		bundled = service.maint.FirmwareVersion()
 	}
-	respond(writer, http.StatusOK, map[string]string{"port": name})
+	respond(writer, http.StatusOK, struct {
+		device.Status
+		BundledVersion  string `json:"bundled_firmware_version,omitempty"`
+		UpdateAvailable bool   `json:"update_available,omitempty"`
+	}{status, bundled, status.CanUpdateTo(bundled)})
 }
 
 func (service *Service) enqueue(frame device.Frame, dedupe bool) Status {

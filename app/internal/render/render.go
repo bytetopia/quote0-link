@@ -152,7 +152,7 @@ func pack(canvas *image.Gray) device.Frame {
 	var frame device.Frame
 	for row := 0; row < device.Height; row++ {
 		for col := 0; col < device.Width; col++ {
-			if canvas.GrayAt(row, height-1-col).Y >= 128 {
+			if canvas.GrayAt(width-1-row, col).Y >= 128 {
 				offset := row*device.Width + col
 				frame[offset/8] |= 0x80 >> (offset % 8)
 			}

@@ -44,34 +44,54 @@ type Request struct {
 }
 
 type Status struct {
-	Available bool     `json:"available"`
-	MAC       string   `json:"mac,omitempty"`
-	Port      string   `json:"port,omitempty"`
-	Backups   []string `json:"backups"`
-	Busy      bool     `json:"busy"`
-	State     string   `json:"state"`
-	Message   string   `json:"message,omitempty"`
+	Available bool      `json:"available"`
+	MAC       string    `json:"mac,omitempty"`
+	Port      string    `json:"port,omitempty"`
+	Busy      bool      `json:"busy"`
+	Action    string    `json:"action,omitempty"`
+	State     string    `json:"state"`
+	Message   string    `json:"message,omitempty"`
+	Download  *Download `json:"download,omitempty"`
+}
+
+type Download struct {
+	ID       uint64 `json:"id"`
+	Filename string `json:"filename"`
 }
 
 type Manager struct {
 	link      *device.Link
 	testFrame device.Frame
 	assets    string
-	backups   string
+	version   string
 	mu        sync.Mutex
 	closing   bool
 	status    Status
+	backup    []byte
+	backupID  uint64
+	expiry    *time.Timer
 }
 
-func New(link *device.Link, executable, dataDirectory string, testFrame device.Frame) *Manager {
+func New(link *device.Link, executable string, testFrame device.Frame) *Manager {
 	assets := filepath.Join(filepath.Dir(executable), "maintenance")
 	if runtime.GOOS == "darwin" {
 		assets = filepath.Join(filepath.Dir(executable), "..", "Resources", "maintenance")
 	}
-	return &Manager{
-		link: link, testFrame: testFrame, assets: assets,
-		backups: filepath.Join(dataDirectory, "backups"), status: Status{State: "idle"},
+	manager := &Manager{
+		link: link, testFrame: testFrame, assets: assets, status: Status{State: "idle"},
 	}
+	file, err := os.ReadFile(filepath.Join(assets, "firmware", "standard", "version.txt"))
+	if err == nil {
+		version := strings.TrimSpace(string(file))
+		if _, valid := device.ParseFirmwareVersion(version); valid {
+			manager.version = version
+		}
+	}
+	return manager
+}
+
+func (manager *Manager) FirmwareVersion() string {
+	return manager.version
 }
 
 func (manager *Manager) tool() string {
@@ -89,8 +109,8 @@ func (manager *Manager) Status() Status {
 	if info, err := os.Stat(manager.tool()); err == nil && info.Mode().IsRegular() {
 		status.Available = true
 	}
-	status.Backups = manager.listBackups()
 	if !status.Busy {
+		status.MAC, status.Port = "", ""
 		if target, err := manager.link.Target(); err == nil {
 			mac := canonicalMAC(target.USBSerial)
 			if macPattern.MatchString(mac) {
@@ -114,21 +134,49 @@ func (manager *Manager) CloseIdle() bool {
 		return false
 	}
 	manager.closing = true
+	manager.clearBackup()
 	return true
 }
 
-func (manager *Manager) Start(request Request) error {
-	if !request.Confirm || !macPattern.MatchString(request.MAC) || !validVariant(request.Variant) {
-		return errors.New("请确认设备、屏幕版本及本次操作")
+func validateRequest(request Request, backup []byte) ([]byte, error) {
+	if !request.Confirm || !macPattern.MatchString(request.MAC) {
+		return nil, errors.New("请确认设备及本次操作")
 	}
 	switch request.Action {
-	case "backup", "restore":
+	case "backup":
+		if !validVariant(request.Variant) {
+			return nil, errors.New("请选择屏幕版本")
+		}
+		if len(backup) != 0 {
+			return nil, errors.New("备份原厂不需要上传文件")
+		}
+		return nil, nil
 	case "install":
 		if request.Variant != "standard" {
-			return errors.New("首发版（UC8151）暂不支持安装 Link 固件")
+			return nil, errors.New("请选择标准版；首发版（UC8151）暂不支持安装 Link 固件")
 		}
+		return nil, nil
+	case "restore":
 	default:
-		return errors.New("未知的设备维护操作")
+		return nil, errors.New("未知的设备维护操作")
+	}
+	if len(backup) == 0 {
+		return nil, errors.New("请选择这台设备的 .q0backup 原厂备份")
+	}
+	header, image, err := parseBackup(backup)
+	if err != nil {
+		return nil, err
+	}
+	if header.MAC != request.MAC {
+		return nil, errors.New("备份不属于当前设备；没有写入")
+	}
+	return image, nil
+}
+
+func (manager *Manager) Start(request Request, backup []byte) error {
+	restoreImage, err := validateRequest(request, backup)
+	if err != nil {
+		return err
 	}
 	if info, err := os.Stat(manager.tool()); err != nil || !info.Mode().IsRegular() {
 		return errors.New("此开发包缺少 esptool，请使用完整安装包")
@@ -138,13 +186,16 @@ func (manager *Manager) Start(request Request) error {
 	if manager.closing || manager.status.Busy {
 		return errors.New("另一个维护任务正在进行，或应用正退出")
 	}
+	if request.Action == "backup" {
+		manager.clearBackup()
+	}
 	manager.status = Status{
-		Busy: true, MAC: request.MAC, State: "running",
+		Busy: true, MAC: request.MAC, Action: request.Action, State: "running", Download: manager.status.Download,
 		Message: "等待释放串口。请保持 USB 连接，不要退出 App。",
 	}
 	go func() {
 		err := manager.link.Maintain(func(target device.Target, show func(device.Frame) error) error {
-			return manager.perform(target, show, request)
+			return manager.perform(target, show, request, restoreImage)
 		})
 		manager.mu.Lock()
 		defer manager.mu.Unlock()
@@ -154,7 +205,7 @@ func (manager *Manager) Start(request Request) error {
 		} else {
 			manager.status.State = "done"
 			manager.status.Message = map[string]string{
-				"backup":  "原厂备份已保存，双读 SHA-256 校验一致。建议导出保留一份。",
+				"backup":  "双读 SHA-256 校验一致，请下载并妥善保存 .q0backup 文件。",
 				"install": "固件已写入并校验，设备已确认刷新测试卡。",
 				"restore": "原厂 Flash 已写回并校验。请在 Dot. App 检查设备是否正常。",
 			}[request.Action]
@@ -163,17 +214,42 @@ func (manager *Manager) Start(request Request) error {
 	return nil
 }
 
-func (manager *Manager) Import(data []byte) (string, error) {
+func (manager *Manager) Download(id uint64) (Download, []byte, error) {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
-	if manager.status.Busy || manager.closing {
-		return "", errors.New("请等当前维护操作完成")
+	if manager.status.Download == nil || manager.status.Download.ID != id {
+		return Download{}, nil, errors.New("备份下载已过期或不存在，请重新备份")
 	}
-	return manager.writeBackup(data)
+	return *manager.status.Download, manager.backup, nil
 }
 
-func (manager *Manager) Export(mac string) ([]byte, error) {
-	return manager.readBackup(mac)
+func (manager *Manager) stashBackup(mac string, data []byte) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	manager.clearBackup()
+	manager.backupID++
+	id := manager.backupID
+	manager.backup = data
+	manager.status.Download = &Download{ID: id, Filename: "quote0-" + mac + ".q0backup"}
+	manager.expiry = time.AfterFunc(10*time.Minute, func() {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		if manager.backupID == id {
+			manager.clearBackup()
+			if manager.status.Action == "backup" && manager.status.State == "done" {
+				manager.status.Message = "此备份的临时下载已过期。需要新副本时，请重新备份。"
+			}
+		}
+	})
+}
+
+func (manager *Manager) clearBackup() {
+	if manager.expiry != nil {
+		manager.expiry.Stop()
+		manager.expiry = nil
+	}
+	manager.status.Download = nil
+	manager.backup = nil
 }
 
 func (manager *Manager) step(message string) {
@@ -182,37 +258,19 @@ func (manager *Manager) step(message string) {
 	manager.mu.Unlock()
 }
 
-func (manager *Manager) perform(target device.Target, show func(device.Frame) error, request Request) error {
+func (manager *Manager) perform(target device.Target, show func(device.Frame) error, request Request, restoreImage []byte) error {
 	if canonicalMAC(target.USBSerial) != request.MAC {
 		return errors.New("已连接设备已变更；请重新选择并确认")
 	}
-	var restoreImage []byte
 	var segments []string
-	if request.Action == "backup" {
-		if _, err := os.Lstat(manager.backupPath(request.MAC)); !errors.Is(err, os.ErrNotExist) {
-			return errors.New("这台设备的备份已存在或无法访问；不会覆盖")
-		}
-	} else {
-		data, err := manager.readBackup(request.MAC)
+	if request.Action == "install" {
+		var err error
+		segments, err = manager.imageSegments()
 		if err != nil {
-			return fmt.Errorf("未找到同一台设备的有效备份：%w", err)
-		}
-		header, image, err := parseBackup(data)
-		if err != nil || header.Variant != request.Variant {
-			return errors.New("所选屏幕版本与备份记录不匹配")
-		}
-		restoreImage = image
-		if request.Action == "install" {
-			segments, err = manager.imageSegments()
-			if err != nil {
-				return err
-			}
+			return err
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(manager.backups), 0700); err != nil {
-		return err
-	}
-	work, err := os.MkdirTemp(filepath.Dir(manager.backups), ".maintenance-")
+	work, err := os.MkdirTemp("", "quote0-link-maintenance-")
 	if err != nil {
 		return err
 	}
@@ -292,14 +350,14 @@ func (manager *Manager) capture(work string, request Request, call func(string, 
 		return err
 	}
 	if len(left) != FlashSize || len(right) != FlashSize || sha256.Sum256(left) != sha256.Sum256(right) {
-		return errors.New("两次完整读取的尺寸或 SHA-256 不一致；没有保存备份")
+		return errors.New("两次完整读取的尺寸或 SHA-256 不一致；没有生成备份")
 	}
 	content, err := makeBackup(request.MAC, request.Variant, left)
 	if err != nil {
 		return err
 	}
-	_, err = manager.writeBackup(content)
-	return err
+	manager.stashBackup(request.MAC, content)
+	return nil
 }
 
 func (manager *Manager) runTool(work string, target device.Target, manual bool, after, command string, args ...string) (string, error) {

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tarfile
@@ -25,6 +26,10 @@ SEGMENTS = {
     0x8000: ("partition_table/partition-table.bin", 0x1000),
     0x10000: ("quote0-link.bin", 0x100000),
 }
+APP_DESCRIPTOR_OFFSET = 24 + 8
+APP_DESCRIPTOR_MAGIC = b"\x32\x54\xcd\xab"
+APP_VERSION_OFFSET = APP_DESCRIPTOR_OFFSET + 16
+APP_VERSION_SIZE = 32
 
 
 def digest(path):
@@ -89,6 +94,19 @@ def package_firmware(build, resources):
     expected = {address: path for address, (path, _) in SEGMENTS.items()}
     if mapping != expected:
         raise ValueError("ESP-IDF flash layout differs from the supported standard variant")
+    release_version = (ROOT / "firmware" / "version.txt").read_text(encoding="utf-8").strip()
+    project = json.loads((build / "project_description.json").read_text(encoding="utf-8"))
+    if not re.fullmatch(r"(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){2}", release_version):
+        raise ValueError("Invalid firmware version; expected X.Y.Z")
+    if project["project_version"] != release_version:
+        raise ValueError(f"Firmware build is not version {release_version}; rebuild firmware before packaging")
+    app_image = (build / "quote0-link.bin").read_bytes()
+    image_version = app_image[APP_VERSION_OFFSET:APP_VERSION_OFFSET + APP_VERSION_SIZE].split(b"\0", 1)[0]
+    if (app_image[APP_DESCRIPTOR_OFFSET:APP_DESCRIPTOR_OFFSET + 4] != APP_DESCRIPTOR_MAGIC
+            or image_version != release_version.encode("ascii")):
+        raise ValueError(f"Compiled firmware image reports a version other than {release_version}")
+    if b"Q0LINK 1 152 296\n" not in app_image or b"Q0VERSION\0" not in app_image:
+        raise ValueError("Not a versioned Quote0 Link firmware build")
     target = resources / "firmware" / "standard"
     target.mkdir(parents=True, exist_ok=True)
     hashes = {}
@@ -98,9 +116,8 @@ def package_firmware(build, resources):
             raise ValueError(f"Unexpected segment length: {source}")
         shutil.copyfile(source, target / source.name)
         hashes[source.name] = digest(target / source.name)
-    if b"Q0LINK 1 152 296\n" not in (target / "quote0-link.bin").read_bytes():
-        raise ValueError("Not a Quote0 Link firmware build")
     (target / "sha256.json").write_text(json.dumps(hashes, indent=2) + "\n", encoding="utf-8")
+    (target / "version.txt").write_text(release_version + "\n", encoding="utf-8")
 
 
 def main():
