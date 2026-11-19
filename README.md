@@ -4,13 +4,13 @@
 
 ## 界面预览
 
-**安装 Link**：选择屏幕版本后安装 App 内置的 Link 固件。
+**内容投送**：选用文字、图片或信息卡模板，发送到 Quote/0。
 
-![安装 Link 固件界面](docs/screenshots/maintenance-install.png)
+![内容投送：编辑并发送信息卡](docs/screenshots/display.png)
 
-| 备份原厂 | 恢复原厂 |
+| 应用集成 | 设备维护 |
 |---|---|
-| ![备份校验完成后下载文件](docs/screenshots/maintenance-backup.png) | ![选择本地备份文件恢复原厂固件](docs/screenshots/maintenance-restore.png) |
+| ![应用集成：配置 Codex 和 Claude Code 的 Hook](docs/screenshots/integrations.png) | ![设备维护：备份、安装和恢复固件](docs/screenshots/maintenance.png) |
 
 截图中的设备标识、固件状态和电池读数均为示例。
 
