@@ -22,12 +22,41 @@
 | `app/` | Go 托盘程序，本机 API、管理页、集成目录、模板渲染、USB 串口。管理页关掉后，后台仍能接收事件。 |
 
 ```text
-Codex / Claude Code Hook ──→ /v1/events ──┐
-其他 App / 管理页 ─────────→ /v1/display ─┼─→ 模板渲染 → 1bpp 图帧 → USB → Quote/0
-                                        ┘
+被动（推送）  Codex / Claude Code Hook ──→ /v1/events ──┐
+              任意脚本 / 管理页 ───────→ /v1/display ─┼─→ 模板渲染 → 1bpp 图帧 → USB → Quote/0
+主动（定时）  调度器 → 股价 / Teams 状态 Source ──────┘
 ```
 
 应用接入只需要 HTTP，不需要操作串口；USB 层只接收渲染后的图帧。新增模板只改 App；新增使用场景可以直接调用 API，不需要改 App 或固件。集成目录目前是内置适配器，不是能安装任意第三方代码的远程市场。
+
+### 应用集成：被动与主动
+
+管理页「应用集成」分两个标签：
+
+- **被动 · 接收推送**：启用内置 Hook（Codex、Claude Code），或按页面上的「本机 API」说明（地址、token 文件、接口表、PowerShell/curl 示例）自行接入。
+- **主动 · 定时任务**：App 按时间表拉取数据并上屏。每个任务可选星期一至日、`HH:MM`–`HH:MM` 时间段和间隔分钟数；结束早于开始表示跨越午夜，开始等于结束表示全天。内容未变化时不会重复刷新墨水屏。任务保存在配置目录下 `Quote0 Link/tasks.json`。
+  - **股价**：腾讯行情接口，支持 `600519`、`sh600519`、`00700`、`hk00700`、`AAPL` 等，逗号分隔最多 3 个。
+  - **Teams 状态**：读取本机新版 Teams 的日志（`%LOCALAPPDATA%\Packages\MSTeams_8wekyb3d8bbwe\...\Logs`）中的状态与未读数，副标题显示当前 Teams 账户的显示名（从 Teams 的 `app_settings.json` 取账户 ID，再读本机 OneAuth 账户缓存的 `display_name`，读不到时显示「在线状态」），无需登录或 Graph 权限；仅 Windows。日志超过 20 分钟未更新显示「未运行」。
+
+主动任务与 Hook 共用一块屏幕，后写入者显示。
+
+### 插件结构
+
+核心与集成分离，集成只通过 `internal/plugin` 中的接口与核心交互：
+
+| 目录 | 职责 |
+|---|---|
+| `app/internal/plugin` | 接口与注册表：`Source`（主动，`Fetch` 返回一张卡片）、`Hook`（被动，`Parse` 解析 Hook 输入、`Configure` 写入应用配置）、`Event`、声明式表单 `Field` 与 `Clean`。 |
+| `app/internal/schedule` | 通用调度器：时间表、持久化、执行；不认识任何具体集成。 |
+| `app/internal/server`、`render`、`device` | API、渲染、串口。 |
+| `app/internal/integrations/<name>` | 每个集成一个子目录：`stock`、`teams`、`codex`、`claude`（共享 `agenthook`）。 |
+| `app/internal/integrations/all` | 空白导入所有集成，`main` 只导入它。 |
+
+新增集成：在 `integrations/` 下建子目录，实现 `plugin.Source` 或 `plugin.Hook`，在 `init()` 中调用 `plugin.RegisterSource` / `plugin.RegisterHook`，再在 `all/all.go` 加一行导入。集成只写 Go，不写前端代码：
+
+- **设置表单**：`Source.Fields()` 返回声明式 `plugin.Field` 列表，类型有 `text`、`textarea`、`number`（`Min`/`Max`）、`select`（`Options`）、`toggle`、`secret`，还可设 `Default`、`Required`、`Placeholder`、`Help`。网页据此渲染表单。
+- **校验与保存**：核心先用 `plugin.Clean` 统一校验（丢弃未声明的键、补默认值、检查类型和范围），再交给集成自己的 `Normalize`。结果按任务持久化，执行时通过 `Job.Settings` 传回 `Fetch`。
+- **默认时间表**：可选实现 `plugin.Scheduler` 的 `DefaultSchedule()`，作为新建任务的预填时间表（股价是交易时段，Teams 每 2 分钟）。不实现则用工作日 09:00–18:00、每 5 分钟。
 
 ## 本地构建
 
@@ -66,7 +95,7 @@ make package-mac package-windows
 
 安装和恢复都会核对设备标识，要求安全启动及 Flash 加密均关闭、Flash 容量为 4 MiB；恢复还要求备份与芯片 MAC 匹配。检查失败时不会强刷。写入期间暂停显示任务，完成后校验并重启。恢复后请用 Dot. App 确认设备正常。如果无法自动进入 ROM 下载模式，请按设备说明手动进入后再勾选对应选项。不要拔线或休眠。维护授权不使用 `api-token`；重新加载网页后，维护入口需从托盘重新打开。
 
-原厂固件不能直接接收 Link 图帧。接入多个 Espressif 设备时，可通过 `--port /dev/cu.usbmodem1101` 或 `--port COM4` 指定目标；调试时可用 `--headless`，以 `--font` 指定额外的中文字体（TTF、OTF 或 TTC）。
+原厂固件不能直接接收 Link 图帧。接入多个 Espressif 设备时，可通过 `--port /dev/cu.usbmodem1101` 或 `--port COM4` 指定目标；调试时可用 `--headless`，中文默认使用内置的 Noto Sans SC Medium（SIL OFL 1.1，见 `app/internal/render/fonts/OFL.txt`），各系统显示一致；也可用 `--font` 换成其他中文字体（TTF、OTF 或 TTC）。
 
 管理页左下角显示设备连接状态、已安装的固件版本、USB 供电状态和电池电压。早期固件仍可投图；没有版本或电压读数时会明确提示。若当前安装包内置更新的固件，侧栏会提供升级入口，点击后进入「安装 Link」，不会自动刷写。电压不是充电状态或容量百分比。
 
@@ -82,7 +111,7 @@ curl http://127.0.0.1:45470/v1/display \
   --data '{"template":"card","title":"构建","subtitle":"CI","body":"测试通过"}'
 ```
 
-Windows 令牌通常位于 `%APPDATA%\Quote0 Link\api-token`。无网络请求发往云端。`POST /v1/display` 支持：
+Windows 令牌通常位于 `%APPDATA%\Quote0 Link\api-token`。除你添加的股价任务会请求腾讯行情接口外，无网络请求发往云端。`POST /v1/display` 支持：
 
 | `template` | 参数 |
 |---|---|
@@ -91,6 +120,10 @@ Windows 令牌通常位于 `%APPDATA%\Quote0 Link\api-token`。无网络请求�
 | `card` | `title`、`subtitle`、`body` |
 | `test` | 无，棋盘格 |
 
-返回 `202` 代表已排队，而不是已上屏。未开始的旧任务会被较新的任务替换；`GET /v1/status` 返回最近任务的 `job`、`state` 及可能的 `error`。`GET /v1/device` 返回 `state`、可用的 `port`，以及固件支持时的 `firmware_version`、`usb_power` 和 `battery_mv`。完整包还会报告 `bundled_firmware_version`；检测到可升级时返回 `update_available: true`。只有握手成功才返回 `connected`。设备拔插后，下次提交会重新探测串口；离线期间提交失败的内容不会补发。
+返回 `202` 代表已排队，而不是已上屏。未开始的旧任务会被较新的任务替换；`GET /v1/status` 返回最近任务的 `job`、`state` 及可能的 `error`。
+
+为避免墨水屏无谓刷新，系统会记住上次成功上屏的画面（按设备 USB 序列号区分，系统未提供序列号时按串口名，保存在配置目录 `Quote0 Link/last-frame.json`，重启后仍有效，因为固件开机不清屏）。手动发送、Agent 事件和定时任务都经过同一检查：与屏幕当前内容相同时不发送，`state` 为 `unchanged`。需要强制刷新（例如清除残影）时用 `POST /v1/display?force=true`，或在管理页勾选「内容相同也强制刷新」；测试棋盘格总是强制刷新。发送失败或执行设备维护后缓存会清空。`GET /v1/device` 返回 `state`、可用的 `port`，以及固件支持时的 `firmware_version`、`usb_power` 和 `battery_mv`。完整包还会报告 `bundled_firmware_version`；检测到可升级时返回 `update_available: true`。只有握手成功才返回 `connected`。设备拔插后，下次提交会重新探测串口；离线期间提交失败的内容不会补发。
+
+`GET /v1/api` 返回接口说明与示例。定时任务：`GET /v1/tasks`（任务、上次结果和可用类型）、`POST /v1/tasks`、`PUT /v1/tasks/{id}`、`DELETE /v1/tasks/{id}`、`POST /v1/tasks/{id}/run`。任务字段为 `type`、`name`、`enabled`、`days`（1=周一…7=周日）、`start`、`end`、`interval_minutes`、`settings`。
 
 `POST /v1/events` 接收内置适配器的 `source`、`session`、`state`。集成目录可按应用启用或移除 Hook，同时保留其他 Hook 并备份已有配置。Codex 仍需要审核并信任 Hook；仅支持本机 Hook 可执行的会话。Hook 只转发事件状态和会话 ID，不发提示词，不替用户审批，也不等待墨水屏刷新。

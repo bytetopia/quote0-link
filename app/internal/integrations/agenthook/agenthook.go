@@ -1,4 +1,7 @@
-package integration
+// Package agenthook implements the "hooks" JSON format shared by Codex and
+// Claude Code, so each of those integrations only supplies its config path
+// and a few options.
+package agenthook
 
 import (
 	"bytes"
@@ -10,115 +13,36 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/bytetopia/quote0-link/app/internal/plugin"
 )
 
-type Adapter struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Note string `json:"note"`
+// Events maps the agent's hook event names to core states.
+var Events = map[string]string{
+	"UserPromptSubmit":  plugin.StateWorking,
+	"PermissionRequest": plugin.StateApproval,
+	"PostToolUse":       plugin.StateWorking,
+	"Stop":              plugin.StateFinished,
+	"SessionEnd":        plugin.StateClosed,
 }
 
-var Catalog = []Adapter{
-	{"codex", "Codex", "安装后，在 Codex 中审查并信任 Hook。"},
-	{"claude", "Claude Code", "安装后，启动新会话以加载用户级 Hook。"},
-}
-
-var events = map[string]string{
-	"UserPromptSubmit":  "working",
-	"PermissionRequest": "approval",
-	"PostToolUse":       "working",
-	"Stop":              "finished",
-	"SessionEnd":        "closed",
-}
-
-type Event struct {
-	Source  string `json:"source"`
-	Session string `json:"session"`
-	State   string `json:"state"`
-}
-
-func ReadEvent(source string, payload []byte) (Event, bool) {
+// Parse reads a hook payload carrying session_id and hook_event_name.
+func Parse(payload []byte) (plugin.Event, bool) {
 	var input struct {
 		Session string `json:"session_id"`
 		Event   string `json:"hook_event_name"`
 	}
 	if json.Unmarshal(payload, &input) != nil {
-		return Event{}, false
+		return plugin.Event{}, false
 	}
-	event := Event{source, input.Session, events[input.Event]}
-	return event, event.Valid()
+	state, ok := Events[input.Event]
+	return plugin.Event{Session: input.Session, State: state}, ok && input.Session != ""
 }
 
-func (event Event) Valid() bool {
-	if event.Session == "" || len(event.Session) > 256 {
-		return false
-	}
-	switch event.State {
-	case "working", "approval", "finished", "closed":
-	default:
-		return false
-	}
-	for _, adapter := range Catalog {
-		if adapter.ID == event.Source {
-			return true
-		}
-	}
-	return false
-}
-
-type entry struct {
-	event Event
-	at    time.Time
-}
-
-type Sessions map[[2]string]entry
-
-func (sessions Sessions) Apply(event Event, now time.Time) Event {
-	key := [2]string{event.Source, event.Session}
-	if event.State == "closed" {
-		delete(sessions, key)
-	} else {
-		sessions[key] = entry{event, now}
-	}
-	var selected entry
-	rank := map[string]int{"approval": 3, "working": 2, "finished": 1}
-	for key, current := range sessions {
-		if now.Sub(current.at) > time.Hour {
-			delete(sessions, key)
-			continue
-		}
-		if rank[current.event.State] > rank[selected.event.State] ||
-			(rank[current.event.State] == rank[selected.event.State] && current.at.After(selected.at)) {
-			selected = current
-		}
-	}
-	return selected.event
-}
-
-func Path(source string) (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	switch source {
-	case "codex":
-		dir := os.Getenv("CODEX_HOME")
-		if dir == "" {
-			dir = filepath.Join(home, ".codex")
-		}
-		return filepath.Join(dir, "hooks.json"), nil
-	case "claude":
-		dir := os.Getenv("CLAUDE_CONFIG_DIR")
-		if dir == "" {
-			dir = filepath.Join(home, ".claude")
-		}
-		return filepath.Join(dir, "settings.json"), nil
-	default:
-		return "", errors.New("unknown integration")
-	}
-}
-
-func Configure(path, source, executable string, enabled bool) error {
+// Configure adds or removes the Quote0 Link handler for every event in
+// Events. extra is merged into the command action (for example a shell).
+// The original file is backed up before any change.
+func Configure(path, source, executable string, enabled bool, extra map[string]any) error {
 	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
 		return errors.New("expected a regular configuration file; original configuration left untouched")
 	}
@@ -131,7 +55,7 @@ func Configure(path, source, executable string, enabled bool) error {
 	} else if err != nil {
 		return err
 	}
-	next, changed, err := merge(data, source, executable, enabled)
+	next, changed, err := merge(data, source, executable, enabled, extra)
 	if err != nil || !changed {
 		return err
 	}
@@ -144,10 +68,22 @@ func Configure(path, source, executable string, enabled bool) error {
 			return err
 		}
 	}
-	return AtomicWrite(path, next)
+	return plugin.AtomicWrite(path, next)
 }
 
-func merge(data []byte, source, executable string, enabled bool) ([]byte, bool, error) {
+// ConfigDir returns $env or ~/fallback.
+func ConfigDir(env, fallback string) (string, error) {
+	if dir := os.Getenv(env); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, fallback), nil
+}
+
+func merge(data []byte, source, executable string, enabled bool, extra map[string]any) ([]byte, bool, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf}), &root); err != nil || root == nil {
 		return nil, false, errors.New("expected a JSON object; original configuration left untouched")
@@ -164,12 +100,12 @@ func merge(data []byte, source, executable string, enabled bool) ([]byte, bool, 
 		return nil, false, err
 	}
 	action := map[string]any{"type": "command", "command": command, "timeout": 2}
-	if runtime.GOOS == "windows" && source == "claude" {
-		action["shell"] = "powershell"
+	for key, value := range extra {
+		action[key] = value
 	}
 	handler, _ := json.Marshal(map[string]any{"hooks": []any{action}})
 	changed := false
-	for name := range events {
+	for name := range Events {
 		var groups []json.RawMessage
 		if raw, ok := hooks[name]; ok {
 			if err := json.Unmarshal(raw, &groups); err != nil {
@@ -225,18 +161,4 @@ func shellCommand(executable, marker string) (string, error) {
 		return "'" + strings.ReplaceAll(executable, "'", `'"'"'`) + "'" + marker, nil
 	}
 	return "& '" + strings.ReplaceAll(executable, "'", "''") + "'" + marker, nil
-}
-
-func AtomicWrite(path string, data []byte) error {
-	file, err := os.CreateTemp(filepath.Dir(path), ".quote0-link-")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	_, writeErr := file.Write(data)
-	closeErr := file.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
-		return err
-	}
-	return os.Rename(file.Name(), path)
 }

@@ -22,9 +22,11 @@ import (
 	"time"
 
 	"github.com/bytetopia/quote0-link/app/internal/device"
-	"github.com/bytetopia/quote0-link/app/internal/integration"
+	_ "github.com/bytetopia/quote0-link/app/internal/integrations/all"
 	"github.com/bytetopia/quote0-link/app/internal/maintenance"
+	"github.com/bytetopia/quote0-link/app/internal/plugin"
 	"github.com/bytetopia/quote0-link/app/internal/render"
+	"github.com/bytetopia/quote0-link/app/internal/schedule"
 	"github.com/bytetopia/quote0-link/app/internal/server"
 )
 
@@ -47,7 +49,7 @@ func main() {
 		return
 	}
 	port := flag.String("port", "", "explicit serial device (for example COM4)")
-	font := flag.String("font", defaultFont(), "optional TTF, OTF or TTC fallback font")
+	font := flag.String("font", "", "optional TTF, OTF or TTC font replacing the bundled Noto Sans SC for non-ASCII text")
 	headless := flag.Bool("headless", false, "start only the local server")
 	flag.Parse()
 	if err := run(*port, *font, *headless); err != nil {
@@ -78,7 +80,7 @@ func run(port, font string, headless bool) error {
 	}
 	token := hex.EncodeToString(random[:32])
 	adminToken := hex.EncodeToString(random[32:])
-	if err := integration.AtomicWrite(tokenPath, []byte(token+"\n")); err != nil {
+	if err := plugin.AtomicWrite(tokenPath, []byte(token+"\n")); err != nil {
 		return err
 	}
 	defer os.Remove(tokenPath)
@@ -94,9 +96,16 @@ func run(port, font string, headless bool) error {
 	}
 	manager := maintenance.New(link, executable, testFrame)
 	service.EnableMaintenance(manager, adminToken)
+	scheduler, err := schedule.New(filepath.Join(filepath.Dir(tokenPath), "tasks.json"), service.Show)
+	if err != nil {
+		return err
+	}
+	service.EnableTasks(scheduler, tokenPath)
+	service.PersistFrameCache(filepath.Join(filepath.Dir(tokenPath), "last-frame.json"))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	go service.Run(ctx)
+	go scheduler.Run(ctx)
 	httpServer := &http.Server{
 		Handler: service.Handler(), ReadHeaderTimeout: 4 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 12 * time.Second, IdleTimeout: 30 * time.Second,
@@ -135,8 +144,13 @@ func emit(source string) {
 	if err != nil {
 		return
 	}
-	event, ok := integration.ReadEvent(source, payload)
-	if !ok {
+	hook := plugin.LookupHook(source)
+	if hook == nil {
+		return
+	}
+	event, ok := hook.Parse(payload)
+	event.Source = source
+	if !ok || !event.Valid() {
 		return
 	}
 	path, err := configToken()
@@ -175,20 +189,4 @@ func openBrowser(url string) error {
 		command = exec.Command("xdg-open", url)
 	}
 	return command.Run()
-}
-
-func defaultFont() string {
-	var candidates []string
-	switch runtime.GOOS {
-	case "darwin":
-		candidates = []string{"/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/Supplemental/Songti.ttc"}
-	case "windows":
-		candidates = []string{filepath.Join(os.Getenv("WINDIR"), "Fonts", "msyh.ttc")}
-	}
-	for _, path := range candidates {
-		if _, err := os.Stat(path); err == nil {
-			return path
-		}
-	}
-	return ""
 }

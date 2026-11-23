@@ -8,14 +8,16 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bytetopia/quote0-link/app/internal/device"
-	"github.com/bytetopia/quote0-link/app/internal/integration"
 	"github.com/bytetopia/quote0-link/app/internal/maintenance"
+	"github.com/bytetopia/quote0-link/app/internal/plugin"
 	"github.com/bytetopia/quote0-link/app/internal/render"
+	"github.com/bytetopia/quote0-link/app/internal/schedule"
 )
 
 //go:embed web/*
@@ -32,9 +34,9 @@ type Status struct {
 }
 
 type job struct {
-	frame  device.Frame
-	id     uint64
-	dedupe bool
+	frame device.Frame
+	id    uint64
+	force bool
 }
 
 type Service struct {
@@ -43,13 +45,16 @@ type Service struct {
 	sender                  FrameSender
 	mu                      sync.Mutex
 	configMu                sync.Mutex
-	sessions                integration.Sessions
+	sessions                plugin.Sessions
+	tasks                   *schedule.Scheduler
+	tokenFile               string
 	wake                    chan struct{}
 	pending                 *job
 	status                  Status
 	maint                   *maintenance.Manager
 	maintenanceToken        string
 	resetDisplay            bool
+	cache                   *frameCache
 }
 
 func (service *Service) EnableMaintenance(manager *maintenance.Manager, token string) {
@@ -59,7 +64,7 @@ func (service *Service) EnableMaintenance(manager *maintenance.Manager, token st
 func New(host, token, executable string, renderer render.Renderer, sender FrameSender) *Service {
 	return &Service{
 		host: host, token: token, executable: executable, renderer: renderer, sender: sender,
-		status: Status{State: "idle"}, sessions: make(integration.Sessions), wake: make(chan struct{}, 1),
+		status: Status{State: "idle"}, cache: loadFrameCache(""), sessions: make(plugin.Sessions), wake: make(chan struct{}, 1),
 	}
 }
 
@@ -75,6 +80,14 @@ func (service *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/events", service.auth(service.event))
 	mux.HandleFunc("GET /v1/integrations", service.auth(service.catalog))
 	mux.HandleFunc("PUT /v1/integrations/{id}", service.auth(service.configure))
+	mux.HandleFunc("GET /v1/api", service.auth(service.apiInfo))
+	if service.tasks != nil {
+		mux.HandleFunc("GET /v1/tasks", service.auth(service.listTasks))
+		mux.HandleFunc("POST /v1/tasks", service.auth(service.saveTask))
+		mux.HandleFunc("PUT /v1/tasks/{id}", service.auth(service.saveTask))
+		mux.HandleFunc("DELETE /v1/tasks/{id}", service.auth(service.deleteTask))
+		mux.HandleFunc("POST /v1/tasks/{id}/run", service.auth(service.runTask))
+	}
 	if service.maint != nil {
 		mux.HandleFunc("GET /v1/maintenance", service.maintenanceAuth(service.maintenanceStatus))
 		mux.HandleFunc("POST /v1/maintenance", service.maintenanceAuth(service.startMaintenance))
@@ -141,9 +154,32 @@ func (service *Service) getDevice(writer http.ResponseWriter, _ *http.Request) {
 	}{status, bundled, status.CanUpdateTo(bundled)})
 }
 
-func (service *Service) enqueue(frame device.Frame, dedupe bool) Status {
+// PersistFrameCache stores the last-shown frame fingerprint at path so the
+// skip-unchanged check also survives restarts. Call before Run.
+func (service *Service) PersistFrameCache(path string) {
+	service.cache = loadFrameCache(path)
+}
+
+// deviceID identifies the connected panel so a cached frame is never trusted
+// for a different device. Windows often reports no serial for the composite
+// device's CDC interface, so the port name is the fallback.
+func (service *Service) deviceID() string {
+	if locator, ok := service.sender.(interface{ Target() (device.Target, error) }); ok {
+		if target, err := locator.Target(); err == nil {
+			if target.USBSerial != "" {
+				return target.USBSerial
+			}
+			return target.Port
+		}
+	}
+	return ""
+}
+
+// enqueue queues frame for the panel. Unless force is set, a frame identical
+// to what the panel already shows is skipped.
+func (service *Service) enqueue(frame device.Frame, force bool) Status {
 	service.status = Status{State: "queued", Job: service.status.Job + 1}
-	service.pending = &job{frame, service.status.Job, dedupe}
+	service.pending = &job{frame, service.status.Job, force}
 	select {
 	case service.wake <- struct{}{}:
 	default:
@@ -152,7 +188,6 @@ func (service *Service) enqueue(frame device.Frame, dedupe bool) Status {
 }
 
 func (service *Service) Run(ctx context.Context) {
-	var last *device.Frame
 	for {
 		select {
 		case <-ctx.Done():
@@ -163,7 +198,7 @@ func (service *Service) Run(ctx context.Context) {
 		current := service.pending
 		service.pending = nil
 		if service.resetDisplay {
-			last = nil
+			service.cache.reset()
 			service.resetDisplay = false
 		}
 		if current != nil {
@@ -174,18 +209,21 @@ func (service *Service) Run(ctx context.Context) {
 			continue
 		}
 		var err error
-		if last == nil || !current.dedupe || *last != current.frame {
-			err = service.sender.Send(current.frame)
-		}
-		if err == nil {
-			last = &current.frame
-		} else {
-			last = nil
+		id := service.deviceID()
+		skipped := !current.force && service.cache.same(id, &current.frame)
+		if !skipped {
+			if err = service.sender.Send(current.frame); err == nil {
+				service.cache.remember(id, &current.frame)
+			} else {
+				service.cache.reset()
+			}
 		}
 		service.mu.Lock()
 		if service.status.Job == current.id {
 			service.status.State = "shown"
-			if err != nil {
+			if skipped {
+				service.status.State = "unchanged"
+			} else if err != nil {
 				service.status.State, service.status.Error = "error", err.Error()
 			}
 		}
@@ -210,13 +248,14 @@ func (service *Service) display(writer http.ResponseWriter, request *http.Reques
 		fail(writer, http.StatusConflict, errors.New("设备维护中，已暂停发送"))
 		return
 	}
-	status := service.enqueue(frame, false)
+	force, _ := strconv.ParseBool(request.URL.Query().Get("force"))
+	status := service.enqueue(frame, force)
 	service.mu.Unlock()
 	respond(writer, http.StatusAccepted, status)
 }
 
 func (service *Service) event(writer http.ResponseWriter, request *http.Request) {
-	var event integration.Event
+	var event plugin.Event
 	if err := decode(writer, request, 4096, &event); err != nil {
 		fail(writer, http.StatusBadRequest, err)
 		return
@@ -233,23 +272,24 @@ func (service *Service) event(writer http.ResponseWriter, request *http.Request)
 	}
 	selected := service.sessions.Apply(event, time.Now())
 	card := render.Card{Template: "card", Title: "Quote0 Link", Subtitle: "INTEGRATIONS", Body: "Ready"}
-	for _, adapter := range integration.Catalog {
-		if selected.Source == adapter.ID {
-			card.Title = adapter.Name
-			card.Body = map[string]string{"working": "Working", "approval": "Waiting for approval", "finished": "Turn finished"}[selected.State]
-			break
-		}
+	if hook := plugin.LookupHook(selected.Source); hook != nil {
+		card.Title = hook.Info().Name
+		card.Body = map[string]string{plugin.StateWorking: "Working", plugin.StateApproval: "Waiting for approval", plugin.StateFinished: "Turn finished"}[selected.State]
 	}
 	frame, err := service.renderer.Draw(card)
 	if err != nil {
 		fail(writer, http.StatusInternalServerError, err)
 		return
 	}
-	respond(writer, http.StatusAccepted, service.enqueue(frame, true))
+	respond(writer, http.StatusAccepted, service.enqueue(frame, false))
 }
 
 func (service *Service) catalog(writer http.ResponseWriter, _ *http.Request) {
-	respond(writer, http.StatusOK, integration.Catalog)
+	catalog := []plugin.Info{}
+	for _, hook := range plugin.Hooks() {
+		catalog = append(catalog, hook.Info())
+	}
+	respond(writer, http.StatusOK, catalog)
 }
 
 func (service *Service) configure(writer http.ResponseWriter, request *http.Request) {
@@ -260,15 +300,15 @@ func (service *Service) configure(writer http.ResponseWriter, request *http.Requ
 		fail(writer, http.StatusBadRequest, errors.New("expected an enabled boolean"))
 		return
 	}
-	source := request.PathValue("id")
-	path, err := integration.Path(source)
-	if err != nil {
-		fail(writer, http.StatusBadRequest, err)
+	hook := plugin.LookupHook(request.PathValue("id"))
+	if hook == nil {
+		fail(writer, http.StatusBadRequest, errors.New("unknown integration"))
 		return
 	}
 	service.configMu.Lock()
 	defer service.configMu.Unlock()
-	if err := integration.Configure(path, source, service.executable, *input.Enabled); err != nil {
+	path, err := hook.Configure(service.executable, *input.Enabled)
+	if err != nil {
 		fail(writer, http.StatusInternalServerError, err)
 		return
 	}

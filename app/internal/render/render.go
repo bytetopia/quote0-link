@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/base64"
 	"errors"
 	"image"
@@ -35,10 +36,22 @@ type Renderer struct {
 	fallback *opentype.Font
 }
 
+// cjkFont is bundled so CJK text renders identically on every OS instead of
+// depending on whichever system font happens to be installed.
+//
+//go:embed fonts/NotoSansSC-Medium.otf
+var cjkFont []byte
+
+// New builds a renderer. An empty fontPath uses the bundled Noto Sans SC for
+// non-ASCII text; a non-empty path overrides it with a TTF, OTF or TTC file.
 func New(fontPath string) (Renderer, error) {
 	regular, err := opentype.Parse(goregular.TTF)
 	renderer := Renderer{font: regular}
-	if err != nil || fontPath == "" {
+	if err != nil {
+		return renderer, err
+	}
+	if fontPath == "" {
+		renderer.fallback, err = opentype.Parse(cjkFont)
 		return renderer, err
 	}
 	data, err := os.ReadFile(fontPath)
@@ -102,7 +115,11 @@ func (renderer Renderer) text(canvas *image.Gray, text string, size, x, y, rows 
 		return err
 	}
 	defer face.Close()
-	drawer := font.Drawer{Dst: canvas, Src: image.Black, Face: face}
+	// Glyphs go into a coverage mask first so thin anti-aliased strokes can be
+	// kept with a lower cut-off than the 50% threshold used by pack.
+	mask := image.NewAlpha(canvas.Bounds())
+	defer inkMask(canvas, mask)
+	drawer := font.Drawer{Dst: mask, Src: image.Opaque, Face: face}
 	line := ""
 	for _, value := range text {
 		next := line + string(value)
@@ -144,8 +161,53 @@ func paintImage(canvas *image.Gray, encoded string) error {
 	ratio := min(float64(width)/float64(config.Width), float64(height)/float64(config.Height))
 	targetWidth, targetHeight := max(1, int(float64(config.Width)*ratio)), max(1, int(float64(config.Height)*ratio))
 	offsetX, offsetY := (width-targetWidth)/2, (height-targetHeight)/2
-	scale.BiLinear.Scale(canvas, image.Rect(offsetX, offsetY, offsetX+targetWidth, offsetY+targetHeight), source, source.Bounds(), draw.Over, nil)
+	area := image.Rect(offsetX, offsetY, offsetX+targetWidth, offsetY+targetHeight)
+	scale.CatmullRom.Scale(canvas, area, source, source.Bounds(), draw.Over, nil)
+	dither(canvas, area)
 	return nil
+}
+
+var textInkThreshold uint8 = 80
+
+func inkMask(canvas *image.Gray, mask *image.Alpha) {
+	for i, coverage := range mask.Pix {
+		if coverage >= textInkThreshold {
+			canvas.Pix[i] = 0
+		}
+	}
+}
+
+// dither applies serpentine Floyd–Steinberg error diffusion so the 1-bit panel
+// can approximate grayscale tones with ordinary black/white refreshes.
+func dither(canvas *image.Gray, area image.Rectangle) {
+	w := area.Dx()
+	current, next := make([]int, w+2), make([]int, w+2)
+	for y := area.Min.Y; y < area.Max.Y; y++ {
+		forward := (y-area.Min.Y)%2 == 0
+		for i := 0; i < w; i++ {
+			x := i
+			if !forward {
+				x = w - 1 - i
+			}
+			step := 1
+			if !forward {
+				step = -1
+			}
+			old := int(canvas.GrayAt(area.Min.X+x, y).Y) + current[x+1]/16
+			value := 0
+			if old >= 128 {
+				value = 255
+			}
+			canvas.SetGray(area.Min.X+x, y, color.Gray{Y: uint8(value)})
+			diff := old - value
+			current[x+1+step] += diff * 7
+			next[x+1-step] += diff * 3
+			next[x+1] += diff * 5
+			next[x+1+step] += diff
+		}
+		current, next = next, current
+		clear(next)
+	}
 }
 
 func pack(canvas *image.Gray) device.Frame {

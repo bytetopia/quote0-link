@@ -80,7 +80,10 @@ def package_tool(target, resources):
         f"Source archive: https://github.com/espressif/esptool/archive/refs/tags/{VERSION}.tar.gz\n"
         "The firmware uses the UC8251D driver from the MindReset Quote/0 hardware resources.\n"
         "Driver source: https://github.com/MindReset/dot_open_platform/tree/"
-        "c86603987ba1632b5e2b89fc4704fbf1b007def4\n",
+        "c86603987ba1632b5e2b89fc4704fbf1b007def4\n"
+        "The app embeds Noto Sans SC Medium, licensed under the SIL Open Font License 1.1.\n"
+        "Font source and license: https://github.com/notofonts/noto-cjk "
+        "(app/internal/render/fonts/OFL.txt)\n",
         encoding="utf-8",
     )
 

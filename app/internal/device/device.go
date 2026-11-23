@@ -52,6 +52,9 @@ func (link *Link) Target() (Target, error) {
 	if selected.Port == "" {
 		return Target{}, errors.New("Quote/0 USB serial port not found")
 	}
+	if selected.USBSerial == "" {
+		selected.USBSerial = parentUSBSerial(selected.Port)
+	}
 	return selected, nil
 }
 

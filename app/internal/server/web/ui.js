@@ -68,6 +68,7 @@ async function api(path, method = 'GET', data) {
     headers: {'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'},
     body: data === undefined ? undefined : JSON.stringify(data),
   });
+  if (response.status === 204) return null;
   const result = await response.json();
   if (!response.ok) throw new Error(result.error || response.status);
   return result;
@@ -78,10 +79,12 @@ async function refresh() {
   try {
     const result = await api('status');
     status.value = result.error || ({
-      idle: '等待首次发送', queued: '已排队', sending: '刷新中…', shown: '设备已确认刷新',
+      idle: '等待首次发送', queued: '已排队', sending: '刷新中…', shown: '设备已确认刷新', unchanged: '内容未变化，未刷新屏幕',
     }[result.state] || result.state);
+    status.dataset.state = result.error ? 'error' : result.state;
   } catch (error) {
     status.value = error.message;
+    status.dataset.state = 'error';
   }
 }
 
@@ -138,14 +141,14 @@ function showDevice(result) {
 
 byId('sidebar-update').onclick = () => navigate('maintenance', 'install');
 
-async function send(makeCard) {
+async function send(makeCard, force = byId('force').checked) {
   if (submitting) return;
   submitting = true;
   byId('test').disabled = true;
   byId('display').querySelector('[type=submit]').disabled = true;
   try {
     status.value = '准备发送…';
-    await api('display', 'POST', await makeCard());
+    await api('display' + (force ? '?force=true' : ''), 'POST', await makeCard());
     submitting = false;
     await refresh();
   } catch (error) {
@@ -163,7 +166,7 @@ byId('template').addEventListener('change', event => {
   byId('image-field').hidden = event.target.value !== 'image';
   byId('body-field').hidden = event.target.value === 'image';
 });
-byId('test').addEventListener('click', () => send(() => ({template: 'test'})));
+byId('test').addEventListener('click', () => send(() => ({template: 'test'}), true));
 byId('display').addEventListener('submit', event => {
   event.preventDefault();
   send(async () => {
@@ -222,11 +225,303 @@ async function loadIntegrations() {
   }
 }
 
+function element(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  if (className) node.className = className;
+  return node;
+}
+
+const modeTabs = [...document.querySelectorAll('[data-mode]')];
+function showMode(mode) {
+  for (const button of modeTabs) {
+    const active = button.dataset.mode === mode;
+    byId(button.getAttribute('aria-controls')).hidden = !active;
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
+  }
+}
+for (const [index, button] of modeTabs.entries()) {
+  button.onclick = () => showMode(button.dataset.mode);
+  button.onkeydown = event => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const next = modeTabs[(index + 1) % modeTabs.length];
+    next.click();
+    next.focus();
+  };
+}
+
+let tokenVisible = false;
+function showToken() {
+  byId('api-token').textContent = tokenVisible ? token : '•'.repeat(12);
+  byId('api-token-show').textContent = tokenVisible ? '隐藏' : '显示';
+}
+byId('api-token-show').onclick = () => {
+  tokenVisible = !tokenVisible;
+  showToken();
+};
+byId('api-token-copy').onclick = async () => {
+  const button = byId('api-token-copy');
+  try {
+    await navigator.clipboard.writeText(token);
+    button.textContent = '已复制';
+  } catch {
+    button.textContent = '复制失败';
+  }
+  setTimeout(() => { button.textContent = '复制'; }, 1500);
+};
+
+async function loadApiInfo() {
+  try {
+    const info = await api('api');
+    byId('api-base').textContent = info.base_url;
+    byId('api-token-file').textContent = info.token_file;
+    showToken();
+    const rows = byId('api-endpoints');
+    rows.replaceChildren();
+    for (const item of info.endpoints) {
+      const row = document.createElement('tr');
+      const description = element('td', item.description);
+      if (item.body) description.append(element('code', item.body, 'block'));
+      row.append(element('td', item.method), element('td', item.path), description);
+      rows.append(row);
+    }
+    byId('api-ps').textContent = info.examples.powershell;
+    byId('api-curl').textContent = info.examples.curl;
+  } catch (error) {
+    byId('api-base').textContent = error.message;
+  }
+}
+
+const weekdays = ['一', '二', '三', '四', '五', '六', '日'];
+for (const [index, label] of weekdays.entries()) {
+  const box = element('label', undefined, 'inline');
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.value = String(index + 1);
+  input.checked = index < 5;
+  box.append(input, '周' + label);
+  byId('task-days').append(box);
+}
+
+let taskKinds = [];
+let editingTask;
+let tasksLoading = false;
+
+function describeDays(days) {
+  if (days.length === 7) return '每天';
+  if (days.join() === '1,2,3,4,5') return '工作日';
+  if (days.join() === '6,7') return '周末';
+  return '周' + days.map(day => weekdays[day - 1]).join('、');
+}
+
+function describeTime(task) {
+  const span = task.start === task.end ? '全天' : task.start + '–' + task.end;
+  return `${describeDays(task.days)} · ${span} · 每 ${task.interval_minutes} 分钟`;
+}
+
+function fieldControl(field, value) {
+  let control;
+  switch (field.type) {
+    case 'textarea':
+      control = document.createElement('textarea');
+      control.rows = 3;
+      break;
+    case 'select':
+      control = document.createElement('select');
+      if (!field.required) control.append(new Option('（不选）', ''));
+      for (const option of field.options || []) control.append(new Option(option.label || option.value, option.value));
+      break;
+    case 'toggle':
+      control = document.createElement('input');
+      control.type = 'checkbox';
+      control.checked = value === 'true';
+      break;
+    case 'number':
+      control = document.createElement('input');
+      control.type = 'number';
+      control.step = 1;
+      if (field.min != null) control.min = field.min;
+      if (field.max != null) control.max = field.max;
+      break;
+    default:
+      control = document.createElement('input');
+      if (field.type === 'secret') { control.type = 'password'; control.autocomplete = 'off'; }
+  }
+  control.dataset.key = field.key;
+  control.dataset.type = field.type || 'text';
+  if (field.type !== 'toggle') {
+    control.required = !!field.required;
+    control.value = value;
+    if (field.placeholder && control.tagName !== 'SELECT') control.placeholder = field.placeholder;
+    if (control.tagName !== 'SELECT' && field.type !== 'number') control.maxLength = 500;
+  }
+  return control;
+}
+
+function renderTaskFields(kind, settings) {
+  const container = byId('task-fields');
+  container.replaceChildren();
+  byId('task-type-note').textContent = kind?.note || '';
+  for (const field of kind?.fields || []) {
+    const value = settings ? settings[field.key] ?? (field.type === 'toggle' ? field.default || 'false' : '') : field.default || '';
+    const control = fieldControl(field, value);
+    let label;
+    if (field.type === 'toggle') {
+      label = element('label', '', 'inline');
+      label.append(control, field.label);
+    } else {
+      label = element('label', field.label + (field.required ? '' : '（可选）'));
+      label.append(control);
+    }
+    if (field.help) label.append(element('small', field.help, 'hint'));
+    container.append(label);
+  }
+}
+
+function applySchedule(schedule) {
+  schedule = schedule || { days: [1, 2, 3, 4, 5], start: '09:00', end: '18:00', interval_minutes: 5 };
+  byId('task-start').value = schedule.start;
+  byId('task-end').value = schedule.end;
+  byId('task-interval').value = schedule.interval_minutes;
+  for (const box of byId('task-days').querySelectorAll('input')) box.checked = schedule.days.includes(Number(box.value));
+}
+
+function openTaskForm(task) {
+  editingTask = task;
+  byId('task-form-title').textContent = task ? '编辑任务' : '新建任务';
+  const type = byId('task-type');
+  type.disabled = !!task;
+  type.value = task?.type || taskKinds[0]?.id || '';
+  const kind = taskKinds.find(item => item.id === type.value);
+  byId('task-name').value = task?.name || '';
+  applySchedule(task || kind?.schedule);
+  byId('task-enabled').checked = task ? task.enabled : true;
+  renderTaskFields(kind, task?.settings);
+  byId('task-form-result').value = '';
+  byId('task-form').hidden = false;
+  byId('task-name').focus();
+}
+
+byId('task-type').onchange = event => {
+  const kind = taskKinds.find(item => item.id === event.target.value);
+  if (!editingTask) applySchedule(kind?.schedule);
+  renderTaskFields(kind);
+};
+byId('task-new').onclick = () => openTaskForm();
+byId('task-cancel').onclick = () => { byId('task-form').hidden = true; };
+byId('task-form').onsubmit = async event => {
+  event.preventDefault();
+  const settings = {};
+  for (const control of byId('task-fields').querySelectorAll('[data-key]')) {
+    const value = control.dataset.type === 'toggle' ? String(control.checked) : control.value.trim();
+    if (value) settings[control.dataset.key] = value;
+  }
+  const task = {
+    type: byId('task-type').value,
+    name: byId('task-name').value.trim(),
+    enabled: byId('task-enabled').checked,
+    days: [...byId('task-days').querySelectorAll('input:checked')].map(box => Number(box.value)),
+    start: byId('task-start').value,
+    end: byId('task-end').value,
+    interval_minutes: Number(byId('task-interval').value),
+    settings,
+  };
+  const submit = event.target.querySelector('[type=submit]');
+  submit.disabled = true;
+  try {
+    if (editingTask) await api('tasks/' + encodeURIComponent(editingTask.id), 'PUT', task);
+    else await api('tasks', 'POST', task);
+    byId('task-form').hidden = true;
+    await loadTasks();
+  } catch (error) {
+    byId('task-form-result').value = error.message;
+  } finally {
+    submit.disabled = false;
+  }
+};
+
+function renderTask(task) {
+  const row = element('article', undefined, 'task');
+  const title = element('div', undefined, 'section-title');
+  const kind = taskKinds.find(item => item.id === task.type);
+  title.append(element('h3', task.name), element('span', (kind?.name || task.type) + (task.enabled ? '' : ' · 已停用'), 'badge'));
+  const schedule = element('p', describeTime(task));
+  const last = task.running ? '正在执行…' : task.last_run
+    ? new Date(task.last_run).toLocaleString() + ' · ' + (task.error || task.result || '')
+    : '尚未执行';
+  const result = element('output', last);
+  result.dataset.error = String(!!task.error && !task.running);
+  result.dataset.ok = String(!!task.last_run && !task.error && !task.running);
+  row.dataset.enabled = String(!!task.enabled);
+  const actions = element('div', undefined, 'actions');
+  const buttons = [
+    ['立即执行', '', async () => api('tasks/' + encodeURIComponent(task.id) + '/run', 'POST')],
+    [task.enabled ? '停用' : '启用', 'secondary', async () => {
+      const {last_run: _l, result: _r, error: _e, running: _u, ...plain} = task;
+      await api('tasks/' + encodeURIComponent(task.id), 'PUT', {...plain, enabled: !task.enabled});
+    }],
+    ['编辑', 'secondary', async () => openTaskForm(task)],
+    ['删除', 'secondary', async () => {
+      if (!window.confirm('删除任务「' + task.name + '」？')) return;
+      await api('tasks/' + encodeURIComponent(task.id), 'DELETE');
+    }],
+  ];
+  for (const [label, className, action] of buttons) {
+    const button = element('button', label, className);
+    button.type = 'button';
+    button.onclick = async () => {
+      for (const item of actions.children) item.disabled = true;
+      if (label === '立即执行') { result.value = '正在执行…'; result.dataset.ok = 'false'; result.dataset.error = 'false'; }
+      try {
+        await action();
+        if (label !== '编辑') await loadTasks();
+      } catch (error) {
+        result.value = error.message;
+        result.dataset.error = 'true';
+        result.dataset.ok = 'false';
+      } finally {
+        for (const item of actions.children) item.disabled = false;
+      }
+    };
+    actions.append(button);
+  }
+  row.append(title, schedule, result, actions);
+  return row;
+}
+
+async function loadTasks() {
+  if (tasksLoading) return;
+  tasksLoading = true;
+  const list = byId('tasks');
+  try {
+    const {tasks, kinds} = await api('tasks');
+    if (!taskKinds.length) {
+      taskKinds = kinds;
+      const type = byId('task-type');
+      for (const kind of kinds) {
+        const option = element('option', kind.name);
+        option.value = kind.id;
+        type.append(option);
+      }
+    }
+    list.replaceChildren(...(tasks.length ? tasks.map(renderTask) : [element('p', '还没有定时任务。点击「新建任务」添加' + (taskKinds.map(kind => kind.name).join('、') || '任务') + '。', 'hint')]));
+  } catch (error) {
+    list.replaceChildren(element('p', error.message, 'hint'));
+  } finally {
+    tasksLoading = false;
+  }
+}
+
 refresh();
 refreshDevice();
 loadIntegrations();
+loadApiInfo();
+loadTasks();
 setInterval(refresh, 1200);
 setInterval(refreshDevice, 4500);
+setInterval(() => { if (!byId('mode-pull').hidden) loadTasks(); }, 10000);
 
 let maintenanceInfo;
 let maintenancePending = false;

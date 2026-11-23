@@ -50,6 +50,7 @@
           </div>
           <label id="body-field">正文<textarea id="body" rows="3" maxlength="512">Hello, Quote/0!</textarea></label>
           <label id="image-field" hidden>图片（PNG 或 JPEG，最大 4 MB）<input id="image" type="file" accept="image/png,image/jpeg"></label>
+          <label class="inline" title="默认与屏幕当前内容相同时跳过发送，避免无谓刷新"><input id="force" type="checkbox">内容相同也强制刷新</label>
           <div class="actions"><button type="submit">发送到屏幕</button><button type="button" class="secondary" id="test">发送测试棋盘格</button></div>
         </form>
       </div>
@@ -58,11 +59,52 @@
       <header class="page-heading">
         <p class="eyebrow">02 / INTEGRATIONS</p>
         <h1 id="heading-integrations">应用集成</h1>
-        <p>用本机 Hook 把应用状态自动送上屏幕。关闭此页面后，托盘 App 仍会接收事件。</p>
+        <p>被动集成接收外部推送，主动集成按时间表定时拉取。关闭此页面后，托盘 App 仍在后台运行。</p>
       </header>
       <div class="panel">
-        <div class="section-title"><h2>集成目录</h2><span class="badge">本机 Hook</span></div>
-        <div id="integrations"></div>
+        <div class="tabs" role="tablist" aria-label="集成模式">
+          <button type="button" role="tab" id="mode-tab-push" data-mode="push" aria-selected="true" aria-controls="mode-push">被动 · 接收推送</button>
+          <button type="button" role="tab" id="mode-tab-pull" data-mode="pull" aria-selected="false" aria-controls="mode-pull" tabindex="-1">主动 · 定时任务</button>
+        </div>
+        <div id="mode-push" role="tabpanel" aria-labelledby="mode-tab-push">
+          <div class="section-title"><h2>内置 Hook</h2><span class="badge">本机 Hook</span></div>
+          <div id="integrations"></div>
+          <article id="api-info">
+            <div class="section-title"><h3>本机 API</h3><span class="badge">HTTP</span></div>
+            <p>任何脚本或工具都可以直接调用。仅监听本机，需要 Bearer token；token 每次启动都会更换。</p>
+            <dl class="kv">
+              <dt>地址</dt><dd><code id="api-base">—</code></dd>
+              <dt>Token 文件</dt><dd><code id="api-token-file">—</code></dd>
+              <dt>当前 Token</dt><dd><code id="api-token">—</code> <button type="button" class="secondary small" id="api-token-show">显示</button> <button type="button" class="secondary small" id="api-token-copy">复制</button></dd>
+            </dl>
+            <table class="endpoints"><thead><tr><th>方法</th><th>路径</th><th>说明</th></tr></thead><tbody id="api-endpoints"></tbody></table>
+            <h3 class="sub">PowerShell 示例</h3><pre id="api-ps"></pre>
+            <h3 class="sub">curl 示例</h3><pre id="api-curl"></pre>
+          </article>
+        </div>
+        <div id="mode-pull" role="tabpanel" aria-labelledby="mode-tab-pull" hidden>
+          <div class="section-title"><h2>定时任务</h2><button type="button" id="task-new">新建任务</button></div>
+          <p class="hint">在所选星期的时间段内，每隔 N 分钟执行一次。结束早于开始表示跨越午夜；开始等于结束表示全天。与 Hook 共用屏幕，后写入者显示。</p>
+          <div id="tasks"></div>
+          <form id="task-form" hidden>
+            <h3 id="task-form-title">新建任务</h3>
+            <div class="grid2">
+              <label>类型<select id="task-type"></select></label>
+              <label>名称<input id="task-name" maxlength="40" placeholder="留空使用类型名称"></label>
+            </div>
+            <p class="hint" id="task-type-note"></p>
+            <div id="task-fields"></div>
+            <fieldset class="days"><legend>星期</legend><div id="task-days"></div></fieldset>
+            <div class="grid3">
+              <label>开始<input id="task-start" type="time" value="09:00" required></label>
+              <label>结束<input id="task-end" type="time" value="18:00" required></label>
+              <label>间隔（分钟）<input id="task-interval" type="number" min="1" max="1440" value="5" required></label>
+            </div>
+            <label class="inline"><input id="task-enabled" type="checkbox" checked>启用</label>
+            <div class="actions"><button type="submit">保存</button><button type="button" class="secondary" id="task-cancel">取消</button></div>
+            <output id="task-form-result" role="status"></output>
+          </form>
+        </div>
       </div>
     </section>
     <section class="page" id="page-maintenance" aria-labelledby="heading-maintenance" hidden>
